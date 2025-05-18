@@ -17,7 +17,11 @@ use signal_hook::flag as signal_flag;
 use std::sync::LazyLock;
 use tr::tr;
 
-pub static DEFAULT_SIGNALS: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| {
+/// - Overrides the OS handlers for the signals `SIGTERM`, `SIGINT` and `SIGQUIT`.
+/// - This means that on any of these signals, instead of OS, the crate will execute similar process (default) on program execution.
+/// - This default behavior is only executed if the condition (`AtomicBool`) is set to true.
+/// - Since this condition is wrapped in *Arc*, the instance is shared by all the default handlers. Also any thread can set the value to false to neglect kernel signals.
+pub(crate) static DEFAULT_SIGNALS: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| {
     let arc = Arc::new(AtomicBool::new(true));
     signal_flag::register_conditional_default(SIGTERM, Arc::clone(&arc)).unwrap();
     signal_flag::register_conditional_default(SIGINT, Arc::clone(&arc)).unwrap();
@@ -55,31 +59,24 @@ impl Status {
         self.0
     }
 
+    /// Returns [`Ok`] if the status value is 0.
     pub fn success(self) -> Result<i32, Status> {
-        if self.0 == 0 {
-            Ok(0)
-        } else {
-            Err(self)
-        }
+        (self.0 == 0).then(|| 0).ok_or(self)
     }
 }
 
+/// Generates error string indicating the command executed as child process.
+#[inline]
 fn command_err(cmd: &Command) -> String {
-    format!(
-        "{} {} {}",
-        tr!("failed to run:"),
-        cmd.get_program().to_string_lossy(),
-        cmd.get_args()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    )
+    format!("{} {} {}", tr!("failed to run:"), cmd.get_program().to_string_lossy(), cmd.get_args().map(OsStr::to_string_lossy).collect::<Vec<_>>().join(" "))
 }
 
+/// Executes the child process returning its executuon status
 fn command_status(cmd: &mut Command) -> Result<Status> {
     debug!("running command: {:?}", cmd);
     let term = &*CAUGHT_SIGNAL;
 
+    // ignore system signals
     DEFAULT_SIGNALS.store(false, Ordering::Relaxed);
 
     let ret = cmd
@@ -87,19 +84,20 @@ fn command_status(cmd: &mut Command) -> Result<Status> {
         .map(|s| Status(s.code().unwrap_or(1)))
         .with_context(|| command_err(cmd));
 
+    // restore default handlers
     DEFAULT_SIGNALS.store(true, Ordering::Relaxed);
 
+    // check on any signals caught while execution of child process.
     match term.swap(0, Ordering::Relaxed) {
         0 => ret,
         n => std::process::exit(128 + n as i32),
     }
 }
 
+/// Executes the given command
 pub fn command(cmd: &mut Command) -> Result<()> {
     debug!("running command: {:?}", cmd);
-    command_status(cmd)?
-        .success()
-        .with_context(|| command_err(cmd))?;
+    command_status(cmd)?.success()?;
     Ok(())
 }
 
@@ -149,30 +147,29 @@ fn update_sudo<S: AsRef<OsStr>>(sudo: &str, flags: &[S]) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_lock(config: &Config) {
+/// sleep while pacman is in use
+async fn wait_for_lock(config: &Config) {
     let path = Path::new(config.alpm.dbpath()).join("db.lck");
     let c = config.color;
     if path.exists() {
-        println!(
-            "{} {}",
-            c.error.paint("::"),
-            c.bold
-                .paint(tr!("Pacman is currently in use, please wait..."))
-        );
+        println!("{} {}", c.error.paint("::"), c.bold.paint(tr!("Pacman is currently in use, please wait...")));
 
         while path.exists() {
-            std::thread::sleep(Duration::from_secs(3));
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            // std::thread::sleep(Duration::from_secs(3));
         }
     }
 }
 
-fn new_pacman<S: AsRef<str> + Display + Debug>(config: &Config, args: &Args<S>) -> Command {
+async fn new_pacman<S: AsRef<str> + Display + Debug>(config: &Config, args: &Args<S>) -> Command {
     let mut cmd = if config.need_root {
-        wait_for_lock(config);
+        // upgrade
+        wait_for_lock(config).await;
         let mut cmd = Command::new(&config.sudo_bin);
         cmd.args(&config.sudo_flags).arg(args.bin.as_ref());
         cmd
-    } else {
+    }
+    else {
         Command::new(args.bin.as_ref())
     };
 
@@ -183,16 +180,16 @@ fn new_pacman<S: AsRef<str> + Display + Debug>(config: &Config, args: &Args<S>) 
     cmd
 }
 
-pub fn pacman<S: AsRef<str> + Display + Debug>(config: &Config, args: &Args<S>) -> Result<Status> {
-    let mut cmd = new_pacman(config, args);
+pub async fn pacman<S: AsRef<str> + Display + Debug>(config: &Config, args: &Args<S>) -> Result<Status> {
+    let mut cmd = new_pacman(config, args).await;
     command_status(&mut cmd)
 }
 
-pub fn pacman_output<S: AsRef<str> + Display + std::fmt::Debug>(
+pub async fn pacman_output<S: AsRef<str> + Display + std::fmt::Debug>(
     config: &Config,
     args: &Args<S>,
 ) -> Result<Output> {
-    let mut cmd = new_pacman(config, args);
+    let mut cmd = new_pacman(config, args).await;
     cmd.stdin(Stdio::inherit());
     command_output(&mut cmd)
 }

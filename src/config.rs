@@ -196,7 +196,7 @@ pub enum Sign {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum Op {
+pub(crate) enum Op {
     #[default]
     Default,
     ChrootCtl,
@@ -660,7 +660,7 @@ impl Config {
         self.globals.as_str()
     }
 
-    pub fn parse_args<S: AsRef<str>, I: IntoIterator<Item = S>>(&mut self, iter: I) -> Result<()> {
+    pub async fn parse_args<S: AsRef<str>, I: IntoIterator<Item = S>>(&mut self, iter: I) -> Result<()> {
         let iter = iter.into_iter();
         let mut iter = iter.peekable();
         let mut op_count = 0;
@@ -703,7 +703,7 @@ impl Config {
                     std::process::exit(0);
                 }
                 _ => {
-                    let status = exec::pacman(self, &self.args).unwrap_or(Status(1));
+                    let status = exec::pacman(self, &self.args).await.unwrap_or(Status(1));
                     std::process::exit(status.code());
                 }
             }

@@ -40,9 +40,8 @@ use crate::chroot::Chroot;
 use crate::config::{Config, Op};
 use crate::query::print_upgrade_list;
 
-use std::env::{self, current_dir};
 use std::error::Error as StdError;
-use std::fs::read_to_string;
+use std::{env, fs};
 use std::io::Write;
 
 use std::path::PathBuf;
@@ -65,6 +64,10 @@ macro_rules! printtr {
     }};
 }
 
+/// Checks for the environment variable `PARU_DEBUG`.
+/// 
+/// Returns *false* if set to `0`, else *true*
+#[inline(always)]
 fn debug_enabled() -> bool {
     env::var("PARU_DEBUG").as_deref().unwrap_or("0") != "0"
 }
@@ -74,6 +77,7 @@ fn alpm_debug_enabled() -> bool {
 }
 
 fn print_error(color: Style, err: Error) {
+    // RUST_LIB_BACKTRACE is given priority over RUST_BACKTRACE
     let backtrace_enabled = match env::var("RUST_LIB_BACKTRACE") {
         Ok(s) => s != "0",
         Err(_) => match env::var("RUST_BACKTRACE") {
@@ -83,8 +87,7 @@ fn print_error(color: Style, err: Error) {
     };
 
     if backtrace_enabled {
-        let backtrace = err.backtrace();
-        eprint!("{}", backtrace);
+        eprint!("{}", err.backtrace());
     }
 
     let mut iter = err.chain().peekable();
@@ -109,9 +112,11 @@ fn print_error(color: Style, err: Error) {
 }
 
 pub async fn run<S: AsRef<str>>(args: &[S]) -> i32 {
+    // setting locale
     tr_init!(env::var("LOCALE_DIR")
         .as_deref()
         .unwrap_or("/usr/share/locale/"));
+
     if debug_enabled() {
         let _ = env_logger::Builder::new()
             .filter_level(log::LevelFilter::Debug)
@@ -132,44 +137,37 @@ pub async fn run<S: AsRef<str>>(args: &[S]) -> i32 {
     let _ = &*exec::DEFAULT_SIGNALS;
     let _ = &*exec::RAISE_SIGPIPE;
 
-    let mut config = match Config::new() {
-        Ok(config) => config,
-        Err(err) => {
-            let code = if let Some(&install::Status(e)) = err.downcast_ref() {
-                e
-            } else {
-                1
-            };
-            print_error(Style::new(), err);
-            return code;
-        }
+    let handle_error = |err: anyhow::Error| {
+        let code = match err.downcast_ref() {
+            Some(&install::Status(e)) => e,
+            _ => 1,
+        };
+
+        print_error(Style::new(), err);
+        code
     };
 
-    match run2(&mut config, args).await {
-        Err(err) => {
-            let code = if let Some(&install::Status(e)) = err.downcast_ref() {
-                e
-            } else {
-                1
-            };
-            print_error(Style::new(), err);
-            code
-        }
-        Ok(ret) => ret,
-    }
+    // create config
+    let config = match Config::new() {
+        Ok(config) => config,
+        Err(err) => return handle_error(err),
+    };
+
+    run2(config, args).await.unwrap_or_else(handle_error)
 }
 
-async fn run2<S: AsRef<str>>(config: &mut Config, args: &[S]) -> Result<i32> {
+#[inline(always)]
+async fn run2<S: AsRef<str>>(mut config: Config, args: &[S]) -> Result<i32> {
     if let Some(ref config_path) = config.config_path {
-        let file = read_to_string(config_path)?;
+        let file = fs::read_to_string(config_path)?;
         let name = config_path.display().to_string();
         config.parse(Some(name.as_str()), &file)?;
     };
 
     if args.is_empty() {
-        config.parse_args(["-Syu"])?;
+        config.parse_args(["-Syu"]).await?;
     } else {
-        config.parse_args(args)?;
+        config.parse_args(args).await?;
     }
 
     let aur_url = if config.ssh {
@@ -201,26 +199,24 @@ async fn run2<S: AsRef<str>>(config: &mut Config, args: &[S]) -> Result<i32> {
     handle_cmd(config).await
 }
 
-async fn handle_cmd(config: &mut Config) -> Result<i32> {
-    if (config.op == Op::ChrootCtl || config.chroot)
-        && Command::new("arch-nspawn").arg("-h").output().is_err()
-    {
+async fn handle_cmd(mut config: Config) -> Result<i32> {
+    if (config.op == Op::ChrootCtl || config.chroot) && Command::new("arch-nspawn").arg("-h").output().is_err() {
         bail!(tr!("can not use chroot builds: devtools is not installed"));
     }
 
     let ret = match config.op {
-        Op::Database | Op::Files => exec::pacman(config, &config.args)?.code(),
-        Op::Upgrade => handle_upgrade(config).await?,
-        Op::Build => handle_build(config).await?,
-        Op::Query => handle_query(config).await?,
-        Op::Sync => handle_sync(config).await?,
-        Op::Remove => handle_remove(config)?,
-        Op::DepTest => handle_test(config).await?,
-        Op::GetPkgBuild => handle_get_pkg_build(config).await?,
-        Op::Show => handle_show(config).await?,
-        Op::Default => handle_default(config).await?,
-        Op::RepoCtl => handle_repo(config)?,
-        Op::ChrootCtl => handle_chroot(config)?,
+        Op::Database | Op::Files => exec::pacman(&config, &config.args).await?.code(),
+        Op::Upgrade => handle_upgrade(&mut config).await?,
+        Op::Build => handle_build(&mut config).await?,
+        Op::Query => handle_query(&mut config).await?,
+        Op::Sync => handle_sync(&mut config).await?,
+        Op::Remove => handle_remove(&mut config)?,
+        Op::DepTest => handle_test(&config).await?,
+        Op::GetPkgBuild => handle_get_pkg_build(&mut config).await?,
+        Op::Show => handle_show(&mut config).await?,
+        Op::Default => handle_default(&mut config).await?,
+        Op::RepoCtl => handle_repo(&mut config)?,
+        Op::ChrootCtl => handle_chroot(&config)?,
         // _ => bail!("unknown op '{}'", config.op),
     };
 
@@ -229,11 +225,11 @@ async fn handle_cmd(config: &mut Config) -> Result<i32> {
 
 async fn handle_upgrade(config: &mut Config) -> Result<i32> {
     if config.targets.is_empty() {
-        let dir = current_dir()?;
+        let dir = env::current_dir()?;
         install::build_dirs(config, vec![dir]).await?;
         Ok(0)
     } else {
-        Ok(exec::pacman(config, &config.args)?.code())
+        Ok(exec::pacman(config, &config.args).await?.code())
     }
 }
 
@@ -260,7 +256,7 @@ async fn handle_query(config: &mut Config) -> Result<i32> {
     } else if args.has_arg("u", "upgrades") {
         print_upgrade_list(config).await
     } else {
-        Ok(exec::pacman(config, args)?.code())
+        Ok(exec::pacman(config, args).await?.code())
     }
 }
 
@@ -301,7 +297,7 @@ async fn handle_default(config: &mut Config) -> Result<i32> {
             args.remove("o");
             args.targets = unneeded;
             args.op = "remove";
-            Ok(exec::pacman(config, &args)?.code())
+            Ok(exec::pacman(config, &args).await?.code())
         } else {
             printtr!(" there is nothing to do");
             Ok(0)
@@ -324,7 +320,7 @@ async fn handle_test(config: &Config) -> Result<i32> {
     if config.aur_filter {
         sync::filter(config).await
     } else {
-        Ok(exec::pacman(config, &config.args)?.code())
+        Ok(exec::pacman(config, &config.args).await?.code())
     }
 }
 
@@ -357,7 +353,7 @@ async fn handle_sync(config: &mut Config) -> Result<i32> {
         || config.args.has_arg("p", "print")
         || config.args.has_arg("p", "print-format")
     {
-        Ok(exec::pacman(config, &config.args)?.code())
+        Ok(exec::pacman(config, &config.args).await?.code())
     } else {
         if config.interactive {
             search::interactive_search(config, true).await?;
